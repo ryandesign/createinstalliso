@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# Copyright (c) 2016 Ryan Schmidt
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if [ $# -eq 0 ] ; then
+  echo "usage: $0 <install-macos-app>"
+  exit 1
+fi
+
+if [ "$(id -u)" != 0 ]; then
+  echo "$0: must run this script as root" 1>&2
+  exit 1
+fi
+
+for INSTALLER_APP in "$@" ; do
+  if [ ! -e "$INSTALLER_APP/Contents/SharedSupport/InstallESD.dmg" ] ; then
+    echo "Couldn't find InstallESD.dmg in $INSTALLER_APP" 1>&2
+    exit 1
+  fi
+
+  INSTALLER_NAME="$(defaults read "$INSTALLER_APP/Contents/Info.plist" CFBundleDisplayName)"
+  INSTALLER_VERSION="$(defaults read "$INSTALLER_APP/Contents/Info.plist" CFBundleShortVersionString)"
+
+  BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/macos_installer_build_$(date +%Y%m%d_%H%M%S)_XXXXXXXX")"
+  chmod 755 "$BUILD_DIR"
+
+  BUILD_IMAGE="$BUILD_DIR/build_image"
+  BUILD_IMAGE_SIZE="9999m"
+  echo "--->  Creating empty $BUILD_IMAGE_SIZE build image $BUILD_IMAGE"
+  hdiutil create -o "$BUILD_IMAGE" -size "$BUILD_IMAGE_SIZE" -layout SPUD -fs HFS+J -type SPARSE
+
+  BUILD_IMAGE_VOLUME_NAME="OS X Base System"
+  BUILD_IMAGE_MOUNTPOINT="/Volumes/$BUILD_IMAGE_VOLUME_NAME"
+  echo
+  echo "--->  Mounting build image at $BUILD_IMAGE_MOUNTPOINT"
+  # -noverify
+  hdiutil attach "$BUILD_IMAGE.sparseimage" -mountpoint "$BUILD_IMAGE_MOUNTPOINT" -nobrowse
+
+  INSTALL_ESD_MOUNTPOINT="$BUILD_DIR/install_esd_mountpoint"
+  echo
+  echo "--->  Mounting install ESD at $INSTALL_ESD_MOUNTPOINT"
+  mkdir "$INSTALL_ESD_MOUNTPOINT"
+  # -noverify
+  hdiutil attach "$INSTALLER_APP/Contents/SharedSupport/InstallESD.dmg" -mountpoint "$INSTALL_ESD_MOUNTPOINT" -nobrowse -readonly
+
+  echo
+  echo "--->  Restoring base system to build image"
+  # --noverify
+  asr restore --erase --noprompt --source "$INSTALL_ESD_MOUNTPOINT/BaseSystem.dmg" --target "$BUILD_IMAGE_MOUNTPOINT"
+
+  MACOS_VERSION="$(defaults read "$BUILD_IMAGE_MOUNTPOINT/System/Library/CoreServices/SystemVersion.plist" ProductUserVisibleVersion)"
+  MACOS_BUILD_VERSION="$(defaults read "$BUILD_IMAGE_MOUNTPOINT/System/Library/CoreServices/SystemVersion.plist" ProductBuildVersion)"
+
+  FINAL_ISO="$BUILD_DIR/$INSTALLER_NAME $INSTALLER_VERSION ($MACOS_VERSION $MACOS_BUILD_VERSION).iso"
+
+  echo
+  echo "--->  Copying installation packages from install ESD to build image"
+  rm "$BUILD_IMAGE_MOUNTPOINT/System/Installation/Packages"
+  cp -a "$INSTALL_ESD_MOUNTPOINT/Packages" "$BUILD_IMAGE_MOUNTPOINT/System/Installation/"
+
+  echo
+  echo "--->  Copying base system from install ESD to build image"
+  # Copy El Capitan installer dependencies
+  cp -a "$INSTALL_ESD_MOUNTPOINT/BaseSystem.chunklist" "$INSTALL_ESD_MOUNTPOINT/BaseSystem.dmg" "$BUILD_IMAGE_MOUNTPOINT"
+
+  echo
+  echo "--->  Unmounting install ESD"
+  hdiutil detach "$INSTALL_ESD_MOUNTPOINT"
+  if [ -d "$INSTALL_ESD_MOUNTPOINT" ]; then
+    rmdir "$INSTALL_ESD_MOUNTPOINT"
+  fi
+
+  echo
+  echo "--->  Renaming build image volume to $INSTALLER_NAME"
+  diskutil rename "$BUILD_IMAGE_VOLUME_NAME" "$INSTALLER_NAME"
+  BUILD_IMAGE_VOLUME_NAME="$INSTALLER_NAME"
+  BUILD_IMAGE_MOUNTPOINT="/Volumes/$BUILD_IMAGE_VOLUME_NAME"
+
+  echo
+  echo "--->  Unmounting build image"
+  hdiutil detach "$BUILD_IMAGE_MOUNTPOINT"
+  if [ -d "$BUILD_IMAGE_MOUNTPOINT" ]; then
+    rmdir "$BUILD_IMAGE_MOUNTPOINT"
+  fi
+
+  FINAL_SECTORS="$(hdiutil resize -limits "$BUILD_IMAGE.sparseimage" | tail -n 1 | awk '{ print $1 }')"
+  FINAL_SIZE="$(( FINAL_SECTORS / 2048 + 1 ))m"
+  echo
+  echo "--->  Resizing build image to $FINAL_SIZE"
+  hdiutil resize -size "$FINAL_SIZE" "$BUILD_IMAGE.sparseimage"
+
+  echo
+  echo "--->  Converting build image to ISO format"
+  hdiutil convert "$BUILD_IMAGE.sparseimage" -format UDTO -o "$BUILD_IMAGE"
+  rm -f "$BUILD_IMAGE.sparseimage"
+  mv "$BUILD_IMAGE.cdr" "$FINAL_ISO"
+
+  echo "--->  Built $FINAL_ISO"
+  open "$BUILD_DIR"
+done
