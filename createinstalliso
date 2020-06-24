@@ -20,31 +20,23 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 #
-# Creates an ISO file from a macOS Install app, especially for use with VMware.
-#
-# Adapted from:
-# https://tylermade.net/2017/10/05/how-to-create-a-bootable-iso-image-of-macos-10-13-high-sierra-installer/
+# Creates an ISO file from a macOS Install app or InstallESD.dmg, especially
+# for use with VMware.
 
 set -euxo pipefail
 
-scriptname=$(basename "$0")
+scriptname="${0##*/}"
 
-if [ $# -eq 0 ]; then
-    printf "usage: %s '/path/to/Install macOS Whatever.app'\n" "$scriptname"
+usage() {
+    printf "usage: %s [ Install macOS XXX.app | InstallESD.dmg ]\n" "$scriptname"
     exit
-fi
+}
 
 err() {
     local errmsg="$1"
     local exitcode="${2-1}"
     printf "%s: %s\n" "$scriptname" "$errmsg" 1>&2
     exit "$exitcode"
-}
-
-diskutilerr() {
-    local errmsg=$("$plistbuddy" -c "Print :ErrorMessage" "$plist")
-    local exitcode=$("$plistbuddy" -c "Print :ExitCode" "$plist")
-    err "$errmsg" "$exitcode"
 }
 
 # vercomp by Paused until further notice
@@ -84,132 +76,111 @@ versiontest() {
     [ "$op" == "$2" ]
 }
 
-apppath="$1"
+[ $# -gt 0 ] || usage
 
-[ -e "$apppath" ] || err "'$apppath' does not exist"
-[ -e "$apppath/Contents/SharedSupport" ] || err "'$apppath/Contents/SharedSupport' does not exist"
+if [ "${1##*.}" = "dmg" ]; then
+    esddmg="$1"
+else
+    esddmg="$1"/Contents/SharedSupport/InstallESD.dmg
+fi
+
+[ -f "$esddmg" ] || usage
+
+command -v unbuffer > /dev/null || err "unbuffer is required. You can install it with MacPorts: sudo port install expect"
+
+command -v rsync > /dev/null || err "rsync is required. You can install it with MacPorts: sudo port install rsync"
+
+rsyncversion=$(rsync --version | sed -En '1s/^rsync  version ([^ ]+).*$/\1/p')
+versiontest "$rsyncversion" "<" "3.1.0" && err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
+
+#[ "$(id -u)" = "0" ] || exec sudo "$0" "$@"
 
 : "${TMPDIR=/tmp}"
 
-# Authenticate early, before starting time-consuming operations.
-sudo printf ""
-
 plistbuddy=/usr/libexec/PlistBuddy
 
-appname=$(basename "$apppath" .app)
-appver=$($plistbuddy -c "Print :CFBundleShortVersionString" "$apppath"/Contents/Info.plist)
+cleanup() {
+    echo "$lastprog Cleaning up"
 
-#imgname="$appname $osver $appver"
-imgname="$appname $appver"
-iso="$imgname".iso
-[ -f "$iso" ] && err "'$iso' already exists"
+    [ -d "$tmpmount" ] && hdiutil detach "$tmpmount"
+    [ -d "$basemount" ] && hdiutil detach "$basemount"
+    [ -d "$esdmount" ] && hdiutil detach "$esdmount"
 
-workdir=$(mktemp -d "$TMPDIR"/"$scriptname".XXXXXX)
-#trap 'rm -rf -- "$workdir"' EXIT
-trap 'open -- "$workdir"' EXIT
-plist="$workdir"/disk.plist
+#    rm -rf "$build"
+}
 
-iso="$workdir"/"$iso"
+trap 'cleanup' EXIT
 
-datasize=$(du -sk "$apppath"/Contents/SharedSupport | cut -d $'\t' -f 1)
-imgsize=$(printf "1.2 * %s / 1\n" "$datasize" | bc)
+lastprog=0
+builddir=$(mktemp -d "$TMPDIR/$scriptname".XXXXXX)
+esdmount="$builddir"/esd
+basemount="$builddir"/basesystem
+tmpmount="$builddir"/tmp
+tmpdmg="$builddir"/tmp.sparsebundle
+tmpplist="$builddir"/tmp.plist
 
-# Install OS X Mountain Lion and earlier didn't have createinstallmedia
-#if [[ "$appvermajor" -lt 1 || ("$appvermajor" -eq 1 && ("$appverminor" -lt 3 || "$appverminor" -eq 3 && "$appverpatch" -lt 30)) ]]; then
-if versiontest "$appver" "<" "1.3.30"; then
-    # Can we just convert the ESD image directly?
-    tmpimg="$apppath"/Contents/SharedSupport/InstallESD.dmg
-else
-    # Create a sufficiently large temporary image.
-    tmpimg="$workdir"/"$imgname".sparsebundle
-    hdiutil create -o "$tmpimg" -size "$imgsize"k -layout ISOCD -fs HFS+J
-    mountpoint=/Volumes/"$imgname.$$"
-
-    # Mount the temporary image, hiding it somewhat.
-    hdiutil attach "$tmpimg" -mountpoint "$mountpoint" -nobrowse -noverify -plist > "$plist"
-
-    # Find the image's whole-disk device number.
-    n=0
-    while
-        device=$("$plistbuddy" -c "Print :system-entities:$n:dev-entry" "$plist")
-        tmpcontenthint=$("$plistbuddy" -c "Print :system-entities:$n:content-hint" "$plist" 2>/dev/null)
-        [ "$tmpcontenthint" != "Apple_partition_scheme" ]
-    do
-        n=$((n + 1))
+prog() {
+    local msg="$1"
+    local newmin="$2"
+    local newmax="$3"
+    local oldmax="${4-100}"
+    #echo "$newmin $msg"
+    while IFS= read -r percent; do
+        printf "%.4f %s\n" "$percent" "$msg"
     done
+}
 
-    # Work around a bug in the reissued macOS Sierra installer. See
-    # https://forums.macrumors.com/threads/not-a-valid-volume-mount-point-cant-make-bootable-drive.1935673/page-3?post=28197924#post-28197924
-    # https://ericfromcanada.github.io/output/2020/multi-macos-install-drive-diskmaker.html
-    # https://feedbackassistant.apple.com/feedback/7628029
-    if [ "$appver" == "12.6.06" ]; then
-        sudo plutil -replace CFBundleShortVersionString -string "12.6.03" "$apppath/Contents/Info.plist"
-    fi
+hdiutil attach "$esddmg" -mountpoint "$esdmount" -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | prog "Mounting ESD image" 0 10
 
-    # Create a bootable installer on the image.
-    args=()
-    if versiontest "$appver" "<" "13"; then
-        args+=( --applicationpath "$apppath" )
-    fi
-    args+=( --nointeraction --volume "$mountpoint" )
-    (cd "$apppath"/Contents/Resources && sudo ./createinstallmedia "${args[@]}")
-
-    # Find the new volume name that createinstallmedia assigned.
-    diskutil list -plist "$device" > "$plist" || diskutilerr
-    volname=$("$plistbuddy" -c "Print :VolumesFromDisks:0" "$plist")
-    mountpoint=/Volumes/"$volname"
-
-    # If we worked around the reissued macOS Sierra installer bug, undo the
-    # workaround.
-    if [ "$appver" == "12.6.06" ]; then
-        sudo plutil -replace CFBundleShortVersionString -string "$appver" "$apppath/Contents/Info.plist"
-        sudo plutil -replace CFBundleShortVersionString -string "$appver" "$mountpoint/$(basename "$apppath")/Contents/Info.plist"
-    fi
-
-    # Find the new device number that got assigned.
-    #n=0
-    #while
-    #    device=$("$plistbuddy" -c "Print :AllDisksAndPartitions:0:Partitions:$n:DeviceIdentifier" "$plist")
-    #    tmpvolname=$("$plistbuddy" -c "Print :AllDisksAndPartitions:0:Partitions:$n:VolumeName" "$plist")
-    #    [ "$tmpvolname" != "$volname" ]
-    #do
-    #    n=$((n + 1))
-    #done
-
-    # Find out how much space is used on the disk. This seems to change slightly
-    # shortly after creation (maybe Spotlight indexing?), so wait until it settles
-    # down.
-    #n=0
-    #lastsize=0
-    #while [ "$n" -lt 30 ]; do
-    #    diskutil resizeVolume "$device" limits -plist > "$plist" || diskutilerr
-    #    usedsize=$("$plistbuddy" -c "Print :MinimumSizeNoGuard" "$plist")
-    #    if [ "$usedsize" -eq "$lastsize" ]; then
-    #        n=$((n + 1))
-    #    else
-    #        n=0
-    #        lastsize="$usedsize"
-    #    fi
-    #    sleep 2
-    #done
-
-    # Resize the volume so there is no empty space.
-    #diskutil resizeVolume "$device" "$usedsize"
-
-    # Unmount the volume but leave the image attached.
-    #hdiutil unmount "$device"
-
-    # Create an ISO from just the installer partition.
-    #hdiutil create -o "$cdr" -format UDTO -srcdevice "$device"
-    #mv "$cdr" "$iso"
-
-    # Detach the image.
-    hdiutil detach "$device"
+if [ -f "$esdmount"/boot.efi ]; then
+    systemdmg="$esddmg"
+    systemmount="$esdmount"
+    tmpdmgsize=0
+    copymore=no
+else
+    echo "$lastprog Mounting base system image"
+    systemdmg="$esdmount"/BaseSystem.dmg
+    systemmount="$basemount"
+    hdiutil attach "$systemdmg" -mountpoint "$basemount" -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | prog "Mounting base system image" 10 20
+    tmpdmgsize=$(du -cks "$esdmount"/{BaseSystem.*,Packages} | tail -n1 | cut -d$'\t' -f1)
+    copymore=yes
 fi
 
-# Create a read-only ISO.
-hdiutil makehybrid -o "$iso" "$tmpimg"
-mv "$iso" .
+diskutil info -plist "$systemmount" > "$tmpplist"
+systemsize=$("$plistbuddy" "$tmpplist" -c "Print :Size")
+systemfree=$("$plistbuddy" "$tmpplist" -c "Print :FreeSpace")
+tmpdmgsize=$((tmpdmgsize + (systemsize - systemfree) / 1024 + 512))
 
-# Detach the image.
-#hdiutil detach "$device"
+echo "$lastprog Creating temporary image"
+hdiutil create -o "$tmpdmg" -size "$tmpdmgsize"k -layout ISOCD -fs HFS+J -puppetstrings
+hdiutil attach "$tmpdmg" -mountpoint "$tmpmount" -nobrowse -noverify -plist > "$tmpplist"
+n=0
+while
+    tmpdev=$("$plistbuddy" "$tmpplist" -c "Print :system-entities:$n:dev-entry")
+    mount=$("$plistbuddy" "$tmpplist" -c "Print :system-entities:$n:mount-point" 2>/dev/null || true)
+    [ "$mount" != "$tmpmount" ]
+do
+    n=$((n + 1))
+done
+
+echo "$lastprog Copying system image"
+asr restore --erase --noprompt --puppetstrings --source "$systemdmg" --target "$tmpmount"
+# | unbuffer -p awk '/PINF/ {if ($2<last) {add=100; msg="Verifying"} print $2+add,msg; last=$2; msg=""}'
+
+systemversionplist="$systemmount"/System/Library/CoreServices/SystemVersion.plist
+osversion=$("$plistbuddy" "$systemversionplist" -c 'Print :ProductVersion')
+osbuild=$("$plistbuddy" "$systemversionplist" -c 'Print :ProductBuildVersion')
+appdisplayname=$("$plistbuddy" "$systemmount/Install "*.app/Contents/Info.plist -c 'Print :CFBundleDisplayName')
+installername="$appdisplayname $osversion $osbuild"
+
+diskutil rename "$tmpdev" "$installername"
+tmpmount="/Volumes/$installername"
+
+if [ "$copymore" = "yes" ]; then
+    echo "$lastprog Copying packages and base system"
+    rsync -a --info=progress2 "$esdmount"/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' "$tmpmount" | unbuffer -p tr '\r' '\n' | sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p'
+    rm "$tmpmount"/System/Installation/Packages
+    mv "$tmpmount"/Packages "$tmpmount"/System/Installation/
+fi
+
+find "$tmpmount" -depth 1 \! -name "$appdisplayname".app -print0 | xargs -0 chflags -h hidden
