@@ -27,7 +27,7 @@
 # TODO: Allow an InstallOS.pkg or InstallMacOSX.pkg to be specified
 # TODO: Allow a dmg containing an install pkg or app to be specified
 
-set -euxo pipefail
+set -euo pipefail
 
 scriptname=${0##*/}
 
@@ -80,28 +80,32 @@ versiontest() {
 
 (($# > 0)) || usage
 
-if [ ${1##*.} = "dmg" ]; then
-    esddmg=$1
+input=$1
+
+if [[ ${input##*.} = "dmg" ]]; then
+    esddmg=$input
 else
-    esddmg=$1/Contents/SharedSupport/InstallESD.dmg
+    esddmg=$input/Contents/SharedSupport/InstallESD.dmg
 fi
 
 [[ -f $esddmg ]] || usage
 
-command -v unbuffer > /dev/null || err "unbuffer is required. You can install it with MacPorts: sudo port install expect"
+#command -v unbuffer > /dev/null || err "unbuffer is required. You can install it with MacPorts: sudo port install expect"
 
-command -v rsync > /dev/null || err "rsync is required. You can install it with MacPorts: sudo port install rsync"
+command -v rsync > /dev/null || err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
 
 rsyncversion=$(rsync --version | sed -En '1s/^rsync  version ([^ ]+).*$/\1/p')
 versiontest $rsyncversion "<" "3.1" && err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
 
-#[ "$(id -u)" = "0" ] || exec sudo "$0" "$@"
+#(( $UID == 0 )) || exec sudo $0 "$@"
+#origuid=${SUDO_UID:-$UID}
+#origgid=${SUDO_GID:-$GID}
 
 : ${TMPDIR=/tmp}
 
 plistbuddy=/usr/libexec/PlistBuddy
 
-lastprog=0
+lastprog=1
 
 printprog() {
     printf "%.2f " $lastprog
@@ -110,11 +114,10 @@ printprog() {
 
 scaleprog() {
     local msg=$1
-    local scaledmin=$2
-    local scaledmax=${3-$scaledmin}
+    local scaledmin=$lastprog
+    local scaledmax=${2-$scaledmin}
     local scaledrange=$((scaledmax - scaledmin))
-    local unscaledmax=${4-100}
-    lastprog=$scaledmin
+    local unscaledmax=${3-100}
     printprog $msg
     while IFS= read -r line; do
         [[ -z $line ]] && continue
@@ -128,89 +131,84 @@ scaleprog() {
 cleanup() {
     printprog "Cleaning up"
 
-    [[ -d $tmpmount ]] && hdiutil detach $tmpmount
+    [[ -d $mount ]] && hdiutil detach $mount
     #[[ -d $basemount ]] && hdiutil detach $basemount
     [[ -d $esdmount ]] && hdiutil detach $esdmount
 
-#    rm -rf "$build"
-    trap - EXIT
-    exit 0;
+#    sudo chown -R $origuid:$origgid $builddir
+
+#    rm -rf $builddir
 }
 
-trap 'cleanup' EXIT INT TERM
+traphandler() {
+    cleanup
+    trap - EXIT
+    exit 0
+}
+
+trap 'traphandler' EXIT INT TERM
 
 builddir=$(mktemp -d $TMPDIR/$scriptname.XXXXXX)
+plist=$builddir/tmp.plist
+esdshadow=$builddir/esdshadow
 esdmount=$builddir/esd
-#basemount=$builddir/basesystem
-tmpplist=$builddir/tmp.plist
-shadow=$builddir/shadow
 
 printprog "Mounting electronic software distribution image"
-hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $shadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 0 100
+#hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 0 100
+#script -q /dev/null
+hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 5
 
 if [[ -f $esdmount/boot.efi ]]; then
-    #printprog "Creating writable copy of electronic software distribution image"
-    #hdiutil convert $esddmg -o $tmpdmg -puppetstrings
-    #hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -puppetstrings
-    tmpdmg=$esddmg
-    tmpmount=$esdmount
-    diskutil info -plist $tmpmount > $tmpplist
-    tmpdev=$($plistbuddy $tmpplist -c 'Print :DeviceNode')
+    shadow=$esdshadow
+    mount=$esdmount
+    dmg=$esddmg
+
+    diskutil info -plist $mount > $plist
+    dev=$($plistbuddy $plist -c 'Print :DeviceNode')
 else
-    shadow=
-    #printprog "Mounting base system image"
-    #hdiutil attach $basedmg -mountpoint $basemount -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 0 100
-
-    #diskutil info -plist $basemount > $tmpplist
-    #systemsize=$($plistbuddy $tmpplist -c "Print :Size")
-    #systemfree=$($plistbuddy $tmpplist -c "Print :FreeSpace")
-    #tmpdmgsize=$((tmpdmgsize + (systemsize - systemfree) / 1024 + 512))
-
-
-    printprog "Creating temporary image"
-    basedmg=$esdmount/BaseSystem.dmg
-    basedmgsize=$(hdiutil resize -limits $basedmg | awk '{print int($2/2)+1}')
+    shadow=$builddir/baseshadow
+    mount=$builddir/basesystem
+    dmg=$(dirname $esddmg)/BaseSystem.dmg
+    [[ -f $dmg ]] || dmg=$esdmount/BaseSystem.dmg
+    basedmgsize=$(hdiutil resize -limits $dmg | awk '{print int($2/2)+1}')
     filessize=$(du -cks $esdmount/{BaseSystem.*,Packages} | tail -n1 | cut -d$'\t' -f1)
-    tmpdmgsize=$((basedmgsize + filessize))
-    tmpdmg=$builddir/tmp.sparsebundle
-    tmpmount=$builddir/tmp
-    hdiutil create -o $tmpdmg -size ${tmpdmgsize}k -layout ISOCD -fs HFS+J -puppetstrings
-    hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -puppetstrings | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting temporary image" 0 100
-#    hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -plist > $tmpplist
-#    n=0
-#    while
-#        tmpdev=$($plistbuddy $tmpplist -c "Print :system-entities:$n:dev-entry")
-#        mount=$($plistbuddy $tmpplist -c "Print :system-entities:$n:mount-point" 2>/dev/null || true)
-#        [[ $mount != "$tmpmount" ]]
-#    do
-#        n=$((n + 1))
-#    done
-    diskutil info -plist $tmpmount > $tmpplist
-    tmpdev=$($plistbuddy $tmpplist -c 'Print :DeviceNode')
+    dmgsize=$((basedmgsize + filessize))
 
-    printprog "Restoring base system to temporary image"
-    asr restore --erase --noprompt --puppetstrings --source $basedmg --target $tmpmount | unbuffer -p awk '/PINF/ {if ($2<last) {add=100; msg="Verifying"} print $2+add,msg; last=$2; msg=""}' | scaleprog "Restoring base system to temporary image" 0 100 200
+    printprog "Resizing base system image"
+    hdiutil resize -shadow $shadow -size ${dmgsize}k $dmg
 
-    printprog "Copying packages and other files to temporary image"
-    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $tmpmount | unbuffer -p tr '\r' '\n' | sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and base system to temporary image" 0 100
-    rm -f $tmpmount/System/Installation/Packages
-    mv $tmpmount/Packages $tmpmount/System/Installation/
+    printprog "Mounting base system image"
+#    hdiutil attach $dmg -mountpoint $mount -nobrowse -puppetstrings -shadow $shadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 0 100
+#script -q /dev/null
+    hdiutil attach $dmg -mountpoint $mount -nobrowse -puppetstrings -shadow $shadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 10
+
+    diskutil info -plist $mount > $plist
+    dev=$($plistbuddy $plist -c 'Print :DeviceNode')
+
+    printprog "Copying packages and other files"
+#    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $mount | unbuffer -p tr '\r' '\n' | unbuffer -p sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and other files" 0 100
+#script -q /dev/null
+    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $mount | tr -u '\r' '\n' | sed -Eln 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and other files" 50
+    rm -f $mount/System/Installation/Packages
+    mv $mount/Packages $mount/System/Installation/
 fi
 
-systemversionplist=$tmpmount/System/Library/CoreServices/SystemVersion.plist
+systemversionplist=$mount/System/Library/CoreServices/SystemVersion.plist
 osversion=$($plistbuddy $systemversionplist -c 'Print :ProductVersion')
 osbuild=$($plistbuddy $systemversionplist -c 'Print :ProductBuildVersion')
-appdisplayname=$($plistbuddy $tmpmount/Install\ *.app/Contents/Info.plist -c 'Print :CFBundleDisplayName')
+appdisplayname=$($plistbuddy $mount/Install\ *.app/Contents/Info.plist -c 'Print :CFBundleDisplayName')
 installername="$appdisplayname $osversion $osbuild"
-diskutil rename $tmpdev $installername
-diskutil info -plist $tmpdev > $tmpplist
-tmpmount=$($plistbuddy $tmpplist -c 'Print :MountPoint')
 
-find $tmpmount -depth 1 \! -name $appdisplayname.app -print0 | xargs -0 chflags -h hidden
+diskutil rename $dev $installername
+diskutil info -plist $dev > $plist
+mount=$($plistbuddy $plist -c 'Print :MountPoint')
 
-printprog "Creating ISO image"
-cdr=$builddir/tmp.cdr
+find $mount -depth 1 \! -name $appdisplayname.app -print0 | xargs -0 chflags -h hidden
+
+printprog "Unmounting image"
 iso=$builddir/$installername.iso
-hdiutil detach $tmpmount
-hdiutil convert $tmpdmg ${shadow+-shadow} $shadow -format UDTO -o $cdr -puppetstrings | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Creating ISO image" 0 100
-mv $cdr $iso
+hdiutil detach $mount
+printprog "Creating ISO image"
+#sudo COLUMNS=100 hdiutil makehybrid -o $iso $mount/ | unbuffer -p tr '.' '\n' | unbuffer -p awk 'BEGIN {n=1} /^$/ {print n++}' | scaleprog "Creating ISO image" 0 100
+
+sudo script -q /dev/null hdiutil makehybrid -o $iso -shadow $shadow $dmg | tr -u '.' '\n' | awk 'BEGIN {n=1} /^$/ {print n++; fflush()}' | scaleprog "Creating ISO image" 100 $COLUMNS
