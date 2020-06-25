@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 # Copyright (c) 2020 Ryan Schmidt
 #
@@ -22,165 +22,195 @@
 #
 # Creates an ISO file from a macOS Install app or InstallESD.dmg, especially
 # for use with VMware.
+#
+# TODO: Support High Sierra and later (BaseSystem.dmg next to InstallESD.dmg)
+# TODO: Allow an InstallOS.pkg or InstallMacOSX.pkg to be specified
+# TODO: Allow a dmg containing an install pkg or app to be specified
 
 set -euxo pipefail
 
-scriptname="${0##*/}"
+scriptname=${0##*/}
 
 usage() {
-    printf "usage: %s [ Install macOS XXX.app | InstallESD.dmg ]\n" "$scriptname"
+    printf "usage: %s [ Install macOS XXX.app | InstallESD.dmg ]\n" $scriptname
     exit
 }
 
 err() {
-    local errmsg="$1"
-    local exitcode="${2-1}"
-    printf "%s: %s\n" "$scriptname" "$errmsg" 1>&2
-    exit "$exitcode"
+    local errmsg=$1
+    local exitcode=${2-1}
+    printf "%s: %s\n" $scriptname $errmsg 1>&2
+    exit $exitcode
 }
 
-# vercomp by Paused until further notice
+# Based on vercomp by Paused until further notice but updated with zsh compatibility
 # https://stackoverflow.com/questions/4023830/how-to-compare-two-strings-in-dot-separated-version-format-in-bash
 vercomp() {
-    if [[ $1 == $2 ]]; then
-        return 0
+    [[ $1 == $2 ]] && return 0
+    local i n num1 num2 ver1 ver2 IFS=.
+    if [[ -n ${ZSH_VERSION-} ]]; then
+        ver1=(${=1}) ver2=(${=2})
+    else
+        ver1=($1) ver2=($2)
     fi
-    local IFS=.
-    local i ver1=($1) ver2=($2)
-    # fill empty fields in ver1 with zeros
-    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++)); do
-        ver1[i]=0
-    done
-    for ((i=0; i<${#ver1[@]}; i++)); do
-        if [[ -z ${ver2[i]} ]]; then
-            # fill empty fields in ver2 with zeros
-            ver2[i]=0
-        fi
-        if ((10#${ver1[i]} > 10#${ver2[i]})); then
-            return 1
-        fi
-        if ((10#${ver1[i]} < 10#${ver2[i]})); then
-            return 2
-        fi
+    if ((${#ver1[@]} > ${#ver2[@]})); then
+        n=${#ver1[@]}
+    else
+        n=${#ver2[@]}
+    fi
+    for ((i=0; i<n; i++)); do
+        num1=$((10#${ver1[@]:$i:1}))
+        num2=$((10#${ver2[@]:$i:1}))
+        ((num1 > num2)) && return 1
+        ((num1 < num2)) && return 2
     done
     return 0
 }
 
 versiontest() {
-    vercomp "$1" "$3"
+    local op
+    vercomp $1 $3
     case $? in
         0) op="=";;
         1) op=">";;
         2) op="<";;
     esac
-    [ "$op" == "$2" ]
+    [[ $op == $2 ]]
 }
 
-[ $# -gt 0 ] || usage
+(($# > 0)) || usage
 
-if [ "${1##*.}" = "dmg" ]; then
-    esddmg="$1"
+if [ ${1##*.} = "dmg" ]; then
+    esddmg=$1
 else
-    esddmg="$1"/Contents/SharedSupport/InstallESD.dmg
+    esddmg=$1/Contents/SharedSupport/InstallESD.dmg
 fi
 
-[ -f "$esddmg" ] || usage
+[[ -f $esddmg ]] || usage
 
 command -v unbuffer > /dev/null || err "unbuffer is required. You can install it with MacPorts: sudo port install expect"
 
 command -v rsync > /dev/null || err "rsync is required. You can install it with MacPorts: sudo port install rsync"
 
 rsyncversion=$(rsync --version | sed -En '1s/^rsync  version ([^ ]+).*$/\1/p')
-versiontest "$rsyncversion" "<" "3.1.0" && err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
+versiontest $rsyncversion "<" "3.1" && err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
 
 #[ "$(id -u)" = "0" ] || exec sudo "$0" "$@"
 
-: "${TMPDIR=/tmp}"
+: ${TMPDIR=/tmp}
 
 plistbuddy=/usr/libexec/PlistBuddy
 
-cleanup() {
-    echo "$lastprog Cleaning up"
+lastprog=0
 
-    [ -d "$tmpmount" ] && hdiutil detach "$tmpmount"
-    [ -d "$basemount" ] && hdiutil detach "$basemount"
-    [ -d "$esdmount" ] && hdiutil detach "$esdmount"
+printprog() {
+    printf "%.2f " $lastprog
+    echo "$@"
+}
+
+scaleprog() {
+    local msg=$1
+    local scaledmin=$2
+    local scaledmax=${3-$scaledmin}
+    local scaledrange=$((scaledmax - scaledmin))
+    local unscaledmax=${4-100}
+    lastprog=$scaledmin
+    printprog $msg
+    while IFS= read -r line; do
+        [[ -z $line ]] && continue
+        unscaledprog=${line%% *}
+        lastprog=$(echo "scale=2; $scaledmin + $scaledrange * ($unscaledprog / $unscaledmax)" | bc)
+        printprog ${line:$(($#unscaledprog+1))}
+    done
+    lastprog=$scaledmax
+}
+
+cleanup() {
+    printprog "Cleaning up"
+
+    [[ -d $tmpmount ]] && hdiutil detach $tmpmount
+    #[[ -d $basemount ]] && hdiutil detach $basemount
+    [[ -d $esdmount ]] && hdiutil detach $esdmount
 
 #    rm -rf "$build"
+    trap - EXIT
+    exit 0;
 }
 
-trap 'cleanup' EXIT
+trap 'cleanup' EXIT INT TERM
 
-lastprog=0
-builddir=$(mktemp -d "$TMPDIR/$scriptname".XXXXXX)
-esdmount="$builddir"/esd
-basemount="$builddir"/basesystem
-tmpmount="$builddir"/tmp
-tmpdmg="$builddir"/tmp.sparsebundle
-tmpplist="$builddir"/tmp.plist
+builddir=$(mktemp -d $TMPDIR/$scriptname.XXXXXX)
+esdmount=$builddir/esd
+#basemount=$builddir/basesystem
+tmpplist=$builddir/tmp.plist
+shadow=$builddir/shadow
 
-prog() {
-    local msg="$1"
-    local newmin="$2"
-    local newmax="$3"
-    local oldmax="${4-100}"
-    #echo "$newmin $msg"
-    while IFS= read -r percent; do
-        printf "%.4f %s\n" "$percent" "$msg"
-    done
-}
+printprog "Mounting electronic software distribution image"
+hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $shadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 0 100
 
-hdiutil attach "$esddmg" -mountpoint "$esdmount" -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | prog "Mounting ESD image" 0 10
-
-if [ -f "$esdmount"/boot.efi ]; then
-    systemdmg="$esddmg"
-    systemmount="$esdmount"
-    tmpdmgsize=0
-    copymore=no
+if [[ -f $esdmount/boot.efi ]]; then
+    #printprog "Creating writable copy of electronic software distribution image"
+    #hdiutil convert $esddmg -o $tmpdmg -puppetstrings
+    #hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -puppetstrings
+    tmpdmg=$esddmg
+    tmpmount=$esdmount
+    diskutil info -plist $tmpmount > $tmpplist
+    tmpdev=$($plistbuddy $tmpplist -c 'Print :DeviceNode')
 else
-    echo "$lastprog Mounting base system image"
-    systemdmg="$esdmount"/BaseSystem.dmg
-    systemmount="$basemount"
-    hdiutil attach "$systemdmg" -mountpoint "$basemount" -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | prog "Mounting base system image" 10 20
-    tmpdmgsize=$(du -cks "$esdmount"/{BaseSystem.*,Packages} | tail -n1 | cut -d$'\t' -f1)
-    copymore=yes
+    shadow=
+    #printprog "Mounting base system image"
+    #hdiutil attach $basedmg -mountpoint $basemount -nobrowse -puppetstrings -readonly | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 0 100
+
+    #diskutil info -plist $basemount > $tmpplist
+    #systemsize=$($plistbuddy $tmpplist -c "Print :Size")
+    #systemfree=$($plistbuddy $tmpplist -c "Print :FreeSpace")
+    #tmpdmgsize=$((tmpdmgsize + (systemsize - systemfree) / 1024 + 512))
+
+
+    printprog "Creating temporary image"
+    basedmg=$esdmount/BaseSystem.dmg
+    basedmgsize=$(hdiutil resize -limits $basedmg | awk '{print int($2/2)+1}')
+    filessize=$(du -cks $esdmount/{BaseSystem.*,Packages} | tail -n1 | cut -d$'\t' -f1)
+    tmpdmgsize=$((basedmgsize + filessize))
+    tmpdmg=$builddir/tmp.sparsebundle
+    tmpmount=$builddir/tmp
+    hdiutil create -o $tmpdmg -size ${tmpdmgsize}k -layout ISOCD -fs HFS+J -puppetstrings
+    hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -puppetstrings | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting temporary image" 0 100
+#    hdiutil attach $tmpdmg -mountpoint $tmpmount -nobrowse -noverify -plist > $tmpplist
+#    n=0
+#    while
+#        tmpdev=$($plistbuddy $tmpplist -c "Print :system-entities:$n:dev-entry")
+#        mount=$($plistbuddy $tmpplist -c "Print :system-entities:$n:mount-point" 2>/dev/null || true)
+#        [[ $mount != "$tmpmount" ]]
+#    do
+#        n=$((n + 1))
+#    done
+    diskutil info -plist $tmpmount > $tmpplist
+    tmpdev=$($plistbuddy $tmpplist -c 'Print :DeviceNode')
+
+    printprog "Restoring base system to temporary image"
+    asr restore --erase --noprompt --puppetstrings --source $basedmg --target $tmpmount | unbuffer -p awk '/PINF/ {if ($2<last) {add=100; msg="Verifying"} print $2+add,msg; last=$2; msg=""}' | scaleprog "Restoring base system to temporary image" 0 100 200
+
+    printprog "Copying packages and other files to temporary image"
+    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $tmpmount | unbuffer -p tr '\r' '\n' | sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and base system to temporary image" 0 100
+    rm -f $tmpmount/System/Installation/Packages
+    mv $tmpmount/Packages $tmpmount/System/Installation/
 fi
 
-diskutil info -plist "$systemmount" > "$tmpplist"
-systemsize=$("$plistbuddy" "$tmpplist" -c "Print :Size")
-systemfree=$("$plistbuddy" "$tmpplist" -c "Print :FreeSpace")
-tmpdmgsize=$((tmpdmgsize + (systemsize - systemfree) / 1024 + 512))
-
-echo "$lastprog Creating temporary image"
-hdiutil create -o "$tmpdmg" -size "$tmpdmgsize"k -layout ISOCD -fs HFS+J -puppetstrings
-hdiutil attach "$tmpdmg" -mountpoint "$tmpmount" -nobrowse -noverify -plist > "$tmpplist"
-n=0
-while
-    tmpdev=$("$plistbuddy" "$tmpplist" -c "Print :system-entities:$n:dev-entry")
-    mount=$("$plistbuddy" "$tmpplist" -c "Print :system-entities:$n:mount-point" 2>/dev/null || true)
-    [ "$mount" != "$tmpmount" ]
-do
-    n=$((n + 1))
-done
-
-echo "$lastprog Copying system image"
-asr restore --erase --noprompt --puppetstrings --source "$systemdmg" --target "$tmpmount"
-# | unbuffer -p awk '/PINF/ {if ($2<last) {add=100; msg="Verifying"} print $2+add,msg; last=$2; msg=""}'
-
-systemversionplist="$systemmount"/System/Library/CoreServices/SystemVersion.plist
-osversion=$("$plistbuddy" "$systemversionplist" -c 'Print :ProductVersion')
-osbuild=$("$plistbuddy" "$systemversionplist" -c 'Print :ProductBuildVersion')
-appdisplayname=$("$plistbuddy" "$systemmount/Install "*.app/Contents/Info.plist -c 'Print :CFBundleDisplayName')
+systemversionplist=$tmpmount/System/Library/CoreServices/SystemVersion.plist
+osversion=$($plistbuddy $systemversionplist -c 'Print :ProductVersion')
+osbuild=$($plistbuddy $systemversionplist -c 'Print :ProductBuildVersion')
+appdisplayname=$($plistbuddy $tmpmount/Install\ *.app/Contents/Info.plist -c 'Print :CFBundleDisplayName')
 installername="$appdisplayname $osversion $osbuild"
+diskutil rename $tmpdev $installername
+diskutil info -plist $tmpdev > $tmpplist
+tmpmount=$($plistbuddy $tmpplist -c 'Print :MountPoint')
 
-diskutil rename "$tmpdev" "$installername"
-tmpmount="/Volumes/$installername"
+find $tmpmount -depth 1 \! -name $appdisplayname.app -print0 | xargs -0 chflags -h hidden
 
-if [ "$copymore" = "yes" ]; then
-    echo "$lastprog Copying packages and base system"
-    rsync -a --info=progress2 "$esdmount"/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' "$tmpmount" | unbuffer -p tr '\r' '\n' | sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p'
-    rm "$tmpmount"/System/Installation/Packages
-    mv "$tmpmount"/Packages "$tmpmount"/System/Installation/
-fi
-
-find "$tmpmount" -depth 1 \! -name "$appdisplayname".app -print0 | xargs -0 chflags -h hidden
+printprog "Creating ISO image"
+cdr=$builddir/tmp.cdr
+iso=$builddir/$installername.iso
+hdiutil detach $tmpmount
+hdiutil convert $tmpdmg ${shadow+-shadow} $shadow -format UDTO -o $cdr -puppetstrings | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Creating ISO image" 0 100
+mv $cdr $iso
