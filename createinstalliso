@@ -22,17 +22,13 @@
 #
 # Creates an ISO file from a macOS Install app or InstallESD.dmg, especially
 # for use with VMware.
-#
-# TODO: Support High Sierra and later (BaseSystem.dmg next to InstallESD.dmg)
-# TODO: Allow an InstallOS.pkg or InstallMacOSX.pkg to be specified
-# TODO: Allow a dmg containing an install pkg or app to be specified
 
 set -euo pipefail
 
 scriptname=${0##*/}
 
 usage() {
-    printf "usage: %s [ Install macOS XXX.app | InstallESD.dmg ]\n" $scriptname
+    printf "usage: %s [ Install macOS XXX.app | InstallOS.dmg | InstallESD.dmg ]\n" $scriptname
     exit
 }
 
@@ -80,16 +76,6 @@ versiontest() {
 
 (($# > 0)) || usage
 
-input=$1
-
-if [[ ${input##*.} = "dmg" ]]; then
-    esddmg=$input
-else
-    esddmg=$input/Contents/SharedSupport/InstallESD.dmg
-fi
-
-[[ -f $esddmg ]] || usage
-
 #command -v unbuffer > /dev/null || err "unbuffer is required. You can install it with MacPorts: sudo port install expect"
 
 command -v rsync > /dev/null || err "rsync 3.1.0 or later is required. You can install it with MacPorts: sudo port install rsync"
@@ -101,14 +87,12 @@ versiontest $rsyncversion "<" "3.1" && err "rsync 3.1.0 or later is required. Yo
 #origuid=${SUDO_UID:-$UID}
 #origgid=${SUDO_GID:-$GID}
 
-: ${TMPDIR=/tmp}
-
 plistbuddy=/usr/libexec/PlistBuddy
 
 lastprog=1
 
 printprog() {
-    printf "%.2f " $lastprog
+    printf "PROGRESS:%.2f " $lastprog
     echo "$@"
 }
 
@@ -130,10 +114,10 @@ scaleprog() {
 
 cleanup() {
     printprog "Cleaning up"
-
+    ((progpid != 0)) && kill $progpid
     [[ -d $mount ]] && hdiutil detach $mount
-    #[[ -d $basemount ]] && hdiutil detach $basemount
     [[ -d $esdmount ]] && hdiutil detach $esdmount
+    [[ -d $outermount ]] && hdiutil detach $outermount
 
 #    sudo chown -R $origuid:$origgid $builddir
 
@@ -148,17 +132,78 @@ traphandler() {
 
 trap 'traphandler' EXIT INT TERM
 
+: ${TMPDIR=/tmp}
 builddir=$(mktemp -d $TMPDIR/$scriptname.XXXXXX)
 plist=$builddir/tmp.plist
-esdshadow=$builddir/esdshadow
+outermount=$builddir/outer
+outershadow=$builddir/outershadow
+esddmg=
 esdmount=$builddir/esd
+esdshadow=$builddir/esdshadow
 
-printprog "Mounting electronic software distribution image"
-#hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 0 100
-#script -q /dev/null
-hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 5
+input=$1
+progpid=0
+mount=
+
+if [[ -f $input && ${input##*.} == "dmg" ]]; then
+    # User specified a dmg. Mount it.
+    outerdmg=$input
+    printprog "Mounting ${outerdmg##*/}"
+    hdiutil attach $outerdmg -noverify -mountpoint $outermount -nobrowse -puppetstrings -shadow $outershadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting ${outerdmg##*/}" 5
+    if [[ -f $outermount/Packages/OSInstall.mpkg ]]; then
+        # The dmg is an ESD. Use it.
+        esddmg=$outerdmg
+        esdmount=$outermount
+        esdshadow=$outershadow
+    else
+        # The dmg is not ESD. Find the newest pkg in its root directory.
+        pkg=$(find $outermount -depth 1 -type f -name '*.pkg' -exec stat -f '%m,%N' {} \; | sort -n | head -n1 | cut -d, -f2-)
+        if [[ -n $pkg ]]; then
+            # Found a pkg. Expand it.
+            printprog "Expanding ${pkg##*/}"
+            pkgdir=$builddir/pkg
+            # Sigh, pkgutil provides no status information, so make our
+            # own by monitoring the size of the expanded pkg dir.
+            pkgsize=$(du -sk $pkg | awk '{print $1}')
+            (while :; do [[ -d $pkgdir ]] && du -sk $pkgdir; sleep 2; done) | awk '{print $1; fflush()}' | scaleprog "Expanding ${pkg##*/}" 20 $pkgsize &
+            progpid=$!
+            pkgutil --expand $pkg $pkgdir
+            kill $progpid
+            progpid=0
+            # Look for an ESD in the expanded pkg.
+            dir=$pkgdir
+        else
+            # No pkg found. Look for an ESD on the disk image.
+            dir=$outermount
+        fi
+    fi
+elif [[ -d $input ]]; then
+    # User specified a directory. Look for an ESD in the directory.
+    dir=$input
+else
+    # User specified something we can't use.
+    usage
+fi
+
+if [[ -z $esddmg ]]; then
+    # Find newest ESD in dir.
+    esddmg=$(find $dir -type f -name InstallESD.dmg -exec stat -f '%m,%N' {} \; | sort -n | head -n1 | cut -d, -f2-)
+    if [[ -n $esddmg ]]; then
+        printprog "Mounting ${esddmg##*/}"
+        hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting ${esddmg##*/}" 25
+    fi
+fi
+
+if [[ ! -f $esddmg ]]; then
+    # Still didn't find an ESD. Give up.
+    usage
+fi
+
+#printprog "Mounting electronic software distribution image"
+#hdiutil attach $esddmg -mountpoint $esdmount -nobrowse -puppetstrings -shadow $esdshadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting electronic software distribution image" 5
 
 if [[ -f $esdmount/boot.efi ]]; then
+    # The ESD has a bootable system on it (10.7-10.8). Use that as our dmg.
     shadow=$esdshadow
     mount=$esdmount
     dmg=$esddmg
@@ -166,29 +211,37 @@ if [[ -f $esdmount/boot.efi ]]; then
     diskutil info -plist $mount > $plist
     dev=$($plistbuddy $plist -c 'Print :DeviceNode')
 else
+    # The ESD doesn't have a bootable system (10.9+). Use the base system as our dmg.
     shadow=$builddir/baseshadow
     mount=$builddir/basesystem
-    dmg=$(dirname $esddmg)/BaseSystem.dmg
-    [[ -f $dmg ]] || dmg=$esdmount/BaseSystem.dmg
-    basedmgsize=$(hdiutil resize -limits $dmg | awk '{print int($2/2)+1}')
-    filessize=$(du -cks $esdmount/{BaseSystem.*,Packages} | tail -n1 | cut -d$'\t' -f1)
-    dmgsize=$((basedmgsize + filessize))
+    # Look for the base system in the same directory as the ESD (10.13+).
+    basedir=$(dirname $esddmg)
+    # Look for the base system on the ESD (10.7-10.12).
+    [[ -f $basedir/BaseSystem.dmg ]] || basedir=$esdmount
+    dmg=$basedir/BaseSystem.dmg
 
-    printprog "Resizing base system image"
+    # Make room on the base system for the files we'll copy.
+    printprog "Resizing base system"
+    basedmgsize=$(hdiutil resize -limits $dmg | awk '{print int($2/2)+1}')
+    filessize=$(du -cks $esdmount/Packages $basedir/BaseSystem.* | tail -n1 | cut -d$'\t' -f1)
+    dmgsize=$((basedmgsize + filessize))
     hdiutil resize -shadow $shadow -size ${dmgsize}k $dmg
 
-    printprog "Mounting base system image"
+    printprog "Mounting base system"
 #    hdiutil attach $dmg -mountpoint $mount -nobrowse -puppetstrings -shadow $shadow | unbuffer -p sed -En 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 0 100
 #script -q /dev/null
-    hdiutil attach $dmg -mountpoint $mount -nobrowse -puppetstrings -shadow $shadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system image" 10
+    hdiutil attach $dmg -mountpoint $mount -nobrowse -puppetstrings -shadow $shadow | sed -Eln 's/^PERCENT:([0-9.]+).*$/\1/p' | scaleprog "Mounting base system" 30
 
     diskutil info -plist $mount > $plist
     dev=$($plistbuddy $plist -c 'Print :DeviceNode')
 
-    printprog "Copying packages and other files"
+#    printprog "Copying packages and other files"
 #    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $mount | unbuffer -p tr '\r' '\n' | unbuffer -p sed -En 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and other files" 0 100
 #script -q /dev/null
-    rsync -a --info=progress2 $esdmount/ --include='BaseSystem.*' --include='Packages/***' --exclude='*' $mount | tr -u '\r' '\n' | sed -Eln 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages and other files" 50
+    printprog "Copying base system"
+    rsync -a --info=progress2 $basedir/ --include='BaseSystem.*' --exclude='*' $mount | tr -u '\r' '\n' | sed -Eln 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying base system" 35
+    printprog "Copying packages"
+    rsync -a --info=progress2 $esdmount/ --include='Packages/***' --exclude='*' $mount | tr -u '\r' '\n' | sed -Eln 's/^ *[^ ]+ +([0-9]+).*$/\1/p' | scaleprog "Copying packages" 60
     rm -f $mount/System/Installation/Packages
     mv $mount/Packages $mount/System/Installation/
 fi
@@ -211,4 +264,5 @@ hdiutil detach $mount
 printprog "Creating ISO image"
 #sudo COLUMNS=100 hdiutil makehybrid -o $iso $mount/ | unbuffer -p tr '.' '\n' | unbuffer -p awk 'BEGIN {n=1} /^$/ {print n++}' | scaleprog "Creating ISO image" 0 100
 
+# "script -q /dev/null" unbuffers the output.
 sudo script -q /dev/null hdiutil makehybrid -o $iso -shadow $shadow $dmg | tr -u '.' '\n' | awk 'BEGIN {n=1} /^$/ {print n++; fflush()}' | scaleprog "Creating ISO image" 100 $COLUMNS
